@@ -24,7 +24,9 @@ type Service struct {
 	repo repository
 }
 
-const bpfProgPath = "./radar.o"
+const funcName = "trace_unlinkat"
+const traceGroupSyscalls = "syscalls"
+const bpfProgPath = "./ebpf/radar.o"
 const memLockLimit = 64 * 1024 * 1024 // 64 MiB
 
 func NewService(log *slog.Logger, repo repository) *Service {
@@ -39,24 +41,21 @@ func (s *Service) Start(ctx context.Context) error {
 		return fmt.Errorf("init: %w", err)
 	}
 
-	// Load the compiled eBPF program from ELF
 	spec, err := ebpf.LoadCollectionSpec(bpfProgPath)
 	if err != nil {
 		return fmt.Errorf("failed to load eBPF program: %w", err)
 	}
 
-	// Create a new eBPF Collection
 	collection, err := ebpf.NewCollection(spec)
 	if err != nil {
 		return fmt.Errorf("failed to create eBPF collection: %w", err)
 	}
 	defer collection.Close()
 
-	// Attach the eBPF program to a tracepoint
 	tracepoint, err := link.Tracepoint(
-		"syscalls",
+		traceGroupSyscalls,
 		"sys_enter_unlinkat",
-		collection.Programs["trace_unlinkat"],
+		collection.Programs[funcName],
 		nil,
 	)
 	if err != nil {
@@ -64,7 +63,6 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 	defer tracepoint.Close()
 
-	// Set up a perf event reader to read the output from the eBPF program
 	eventsMap, ok := collection.Maps["events"]
 	if !ok {
 		return fmt.Errorf("failed to find events map in eBPF collection: %w", err)
@@ -76,7 +74,6 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 	defer reader.Close()
 
-	// Goroutine to handle graceful shutdown on receiving a signal
 	go func() {
 		<-ctx.Done()
 		reader.Close()
@@ -87,12 +84,14 @@ func (s *Service) Start(ctx context.Context) error {
 		os.Exit(0)
 	}()
 
+	s.log.Info("waiting for events..")
+
 	for event := range s.parser(ctx, reader) {
 		s.log.Info(
 			"file deleted",
 			slog.Any("pid", event.Pid),
-			slog.String("command", string(event.Comm[:])),
-			slog.String("file", string(event.Filename[:])),
+			slog.String("command", string(bytes.Trim(event.Comm[:], "\x00"))),
+			slog.String("file", string(bytes.Trim(event.Filename[:], "\x00"))),
 		)
 	}
 
@@ -101,34 +100,38 @@ func (s *Service) Start(ctx context.Context) error {
 
 func (s *Service) parser(ctx context.Context, reader *perf.Reader) <-chan coreEvent {
 	output := make(chan coreEvent, 10)
-	defer close(output)
 
 	var event coreEvent
 
-	for {
-		if ctx.Err() != nil {
-			return output
-		}
+	go func(ctx context.Context) {
+		for {
+			if ctx.Err() != nil {
+				s.log.Warn("context canceled")
+				close(output)
 
-		record, err := reader.Read()
-		if err != nil {
-			if errors.Is(err, perf.ErrClosed) {
-				break
+				return
 			}
 
-			s.log.Error("failed to read from perf event reader", "error", err)
+			record, err := reader.Read()
+			if err != nil {
+				if errors.Is(err, perf.ErrClosed) {
+					break
+				}
 
-			continue
+				s.log.Error("failed to read from perf event reader", "error", err)
+
+				continue
+			}
+
+			if err = binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
+				s.log.Error("failed to decode perf event", "error", err)
+
+				continue
+			}
+
+			output <- event
 		}
-
-		if err = binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
-			s.log.Error("failed to decode perf event", "error", err)
-
-			continue
-		}
-
-		output <- event
-	}
+	}(ctx)
 
 	return output
 }

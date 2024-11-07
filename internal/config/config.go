@@ -9,7 +9,7 @@ import (
 )
 
 type Config struct {
-	Logger     *scfg.Logger `valid:"required"`
+	Logger     *scfg.Logger `env:",prefix=LOG_"`
 	Monitoring scfg.Monitoring
 }
 
